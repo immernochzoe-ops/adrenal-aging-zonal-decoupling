@@ -1,0 +1,1016 @@
+---
+title: "Human adrenal single-cell meta-analysis (consensus zonal signature, module scores) and GTEx deconvolution (MuSiC, BisqueRNA)"
+output: html_notebook
+---
+
+Working notebook, kept as it was run. Chunks are independent and each states what it needs. Input paths are relative:
+`data/singlecell/` holds the integrated Seurat object of the public human adrenal single-cell and single-nucleus
+datasets (refs 8, 22-25 of the article) and `data/gtex/` the GTEx v10 adrenal count and TPM matrices.
+Outputs used downstream: `D1_consensus_zonal_signature.csv`, `D2_module_scores_perDonor_byZoneStage.csv`,
+`DECONV_MuSiC_coarse_cortex.csv`, `DECONV_Bisque_coarse_cortex.csv`.
+
+```{r}
+# ============================================================
+# PROBE 1 — inspect the integrated RDS. Read-only. ~2 min.
+# Goal: does per-cell metadata carry donor + age + study + health-status?
+# That single fact decides pseudobulk-from-her-object vs rebuild.
+# ============================================================
+suppressMessages({library(Seurat); library(Matrix)})
+setwd("data/singlecell")
+obj <- readRDS("Hum_Adr_scRNA_anall.combined.rds")
+
+cat("=== OBJECT ===\n")
+cat("class:", class(obj), "| cells:", ncol(obj), "| genes:", nrow(obj), "\n")
+cat("assays:", paste(names(obj@assays), collapse=", "), "| default:", DefaultAssay(obj), "\n")
+cat("reductions:", paste(names(obj@reductions), collapse=", "), "\n\n")
+
+cat("=== METADATA COLUMNS ===\n")
+print(colnames(obj@meta.data))
+
+cat("\n=== METADATA HEAD ===\n")
+print(head(obj@meta.data, 4))
+
+# Probe every plausible name for the 4 columns we need
+cat("\n=== KEY COLUMN CONTENTS (whichever exist) ===\n")
+probes <- c("orig.ident","donor","donor_id","sample","sample_id","patient",
+            "age","age_group","AgeGroup","agegroup","stage","age_stage","group",
+            "study","dataset","source","batch","DOI","paper",
+            "condition","health","status","tumour","tumor","disease","tissue_type")
+for (col in probes) if (col %in% colnames(obj@meta.data)) {
+  cat("\n-- ", col, " --\n"); print(table(obj@meta.data[[col]], useNA="ifany"))
+}
+
+cat("\n=== CLUSTER SIZES (idents) ===\n")
+print(table(Idents(obj)))
+
+cat("\n=== GENE ID TYPE ===\n")
+print(head(rownames(obj), 6))
+panel <- c("CYB5A","SULT2A1","AKR1C3","OSBPL6","LDLR","SCARB1","SOAT1",
+           "CYP11B1","HSD3B2","CYP17A1","FDX1","NR5A1")
+ens <- c("ENSG00000166347","ENSG00000105398","ENSG00000196139","ENSG00000188931",
+         "ENSG00000130164","ENSG00000073060","ENSG00000057252","ENSG00000160882",
+         "ENSG00000203859","ENSG00000148795","ENSG00000137714","ENSG00000136931")
+cat("panel as SYMBOLS in rownames:", sum(panel %in% rownames(obj)), "/", length(panel), "\n")
+cat("panel as ENSEMBL  in rownames:", sum(ens  %in% rownames(obj)), "/", length(ens), "\n")
+
+# The decisive cross-tab: can we count donors per (age x cluster)?
+cat("\n=== DECISIVE CHECK: donors per age group ===\n")
+donor_col <- intersect(c("donor","donor_id","orig.ident","sample","sample_id","patient"), colnames(obj@meta.data))[1]
+age_col   <- intersect(c("age_group","AgeGroup","agegroup","stage","age_stage","group","age"), colnames(obj@meta.data))[1]
+cat("using donor col:", donor_col, "| age col:", age_col, "\n")
+if (!is.na(donor_col) && !is.na(age_col)) {
+  md <- obj@meta.data
+  print(table(unique(md[,c(donor_col,age_col)])[[age_col]]))
+  cat("\n^ If each age group has >=2-3 donors, donor-level pseudobulk is POSSIBLE from the integrated object.\n")
+} else {
+  cat("!! donor and/or age not both present as per-cell columns — pseudobulk-from-her-object blocked.\n")
+}
+cat("\n=== assay layers (need RAW counts for pseudobulk) ===\n")
+for (a in names(obj@assays)) {
+  cat(a, "layers:", paste(tryCatch(Layers(obj[[a]]), error=function(e) slotNames(obj[[a]])), collapse=", "), "\n")
+}
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+```{r}
+# ============================================================
+# PSEUDOBULK 1 — donor-level, Elderly vs Young, per cortical zone
+# Runs on the integrated object. ~5-10 min. Needs: Seurat, edgeR, limma.
+# Design: aggregate RAW counts to (donor x zone), then limma-voom old-vs-young.
+# Donor is the unit of replication → no cluster-DE inflation.
+# ============================================================
+suppressMessages({library(Seurat); library(Matrix); library(edgeR); library(limma)})
+setwd("data/singlecell")
+obj <- readRDS("Hum_Adr_scRNA_anall.combined.rds")
+
+DefaultAssay(obj) <- "RNA"
+md <- obj@meta.data
+
+# ---- 1. collapse the fine celltype labels to coarse zone ----
+ct <- as.character(md$celltype)
+zone <- rep(NA_character_, length(ct))
+zone[grepl("zona reticularis|\\bZR\\b", ct, ignore.case=TRUE)] <- "ZR"
+zone[grepl("zona fasciculata|\\bZF\\b", ct, ignore.case=TRUE)] <- "ZF"
+zone[grepl("zona glomerulosa|\\bZG\\b", ct, ignore.case=TRUE)] <- "ZG"
+# "adrenal cortex" (unzoned) kept separate — do NOT fold into a zone
+zone[grepl("^adrenal cortex", ct, ignore.case=TRUE)] <- "Cortex_unzoned"
+md$zone <- zone
+obj@meta.data <- md
+
+cat("cells per zone:\n"); print(table(md$zone, useNA="ifany"))
+cat("\ndonor x age (unzoned check):\n")
+print(unique(md[,c("orig.ident","age")])[order(unique(md[,c("orig.ident","age")])$age),])
+
+# ---- 2. keep only Elderly + Young (aging contrast; drop Fetal/Neonatal) ----
+keep_age <- md$age %in% c("Elderly","Young")
+# ---- 3. build (donor x zone) pseudobulk from RAW counts ----
+counts <- GetAssayData(obj, assay="RNA", layer="counts")
+zones_use <- c("ZR","ZF","ZG")     # analyze the three true zones
+results <- list()
+
+for (z in zones_use) {
+  sel <- keep_age & md$zone == z & !is.na(md$zone)
+  cat("\n=====", z, ": cells =", sum(sel), "=====\n")
+  donors <- md$orig.ident[sel]
+  ages   <- md$age[sel]
+  udon   <- unique(donors)
+
+  # aggregate counts per donor
+  mat <- sapply(udon, function(d) Matrix::rowSums(counts[, sel & md$orig.ident==d, drop=FALSE]))
+  colnames(mat) <- udon
+  don_age <- ages[match(udon, donors)]
+
+  # require >=50 cells/donor for a stable pseudobulk sample
+  ncell <- sapply(udon, function(d) sum(sel & md$orig.ident==d))
+  ok <- ncell >= 50
+  cat("donors passing >=50 cells:", sum(ok), "of", length(udon), "\n")
+  cat("  by age:", paste(names(table(don_age[ok])), table(don_age[ok]), sep="="), "\n")
+  mat <- mat[, ok, drop=FALSE]; don_age <- don_age[ok]
+  if (sum(don_age=="Elderly")<2 || sum(don_age=="Young")<2) {
+    cat("  !! <2 donors in a group — skipping", z, "\n"); next
+  }
+
+  # limma-voom, Elderly vs Young
+  grp <- factor(don_age, levels=c("Young","Elderly"))
+  dge <- DGEList(mat); dge <- calcNormFactors(dge)
+  keep_g <- filterByExpr(dge, group=grp); dge <- dge[keep_g,,keep.lib.sizes=FALSE]
+  des <- model.matrix(~grp)
+  v <- voom(dge, des); fit <- eBayes(lmFit(v, des))
+  tt <- topTable(fit, coef=2, number=Inf, sort.by="none")
+  tt$ensembl <- rownames(tt); tt$zone <- z
+  results[[z]] <- tt
+}
+
+# ---- 4. pull our panel and print the money table ----
+panel <- c(CYB5A="ENSG00000166347", SULT2A1="ENSG00000105398", AKR1C3="ENSG00000196139",
+           OSBPL6="ENSG00000188931", LDLR="ENSG00000130164", SCARB1="ENSG00000073060",
+           SOAT1="ENSG00000057252", CYP11B1="ENSG00000160882", HSD3B2="ENSG00000203859",
+           CYP17A1="ENSG00000148795", FDX1="ENSG00000137714", NR5A1="ENSG00000136931")
+all_res <- do.call(rbind, results)
+
+cat("\n\n########## PANEL: Elderly-vs-Young pseudobulk logFC by zone ##########\n")
+cat("(positive = UP in elderly; this IS an aging contrast, unlike FindAllMarkers)\n\n")
+out <- data.frame()
+for (g in names(panel)) {
+  sub <- all_res[all_res$ensembl==panel[g], c("zone","logFC","P.Value","adj.P.Val")]
+  if (nrow(sub)) { sub$gene <- g; out <- rbind(out, sub) }
+}
+out <- out[order(out$gene, out$zone), c("gene","zone","logFC","P.Value","adj.P.Val")]
+print(out, row.names=FALSE, digits=3)
+
+# ---- 5. save ----
+write.csv(all_res, "PSEUDOBULK_elderly_vs_young_allgenes_byZone.csv", row.names=FALSE)
+write.csv(out,     "PSEUDOBULK_panel_elderly_vs_young_byZone.csv",     row.names=FALSE)
+cat("\nsaved: PSEUDOBULK_panel_elderly_vs_young_byZone.csv (+ allgenes)\n")
+
+# ---- 6. the decisive readout for the Wang-vs-GTEx tension ----
+cat("\n########## LDLR DIRECTION CHECK (deck slide 13) ##########\n")
+ldlr <- out[out$gene=="LDLR",]
+print(ldlr, row.names=FALSE, digits=3)
+cat("Interpretation:\n",
+"  LDLR logFC<0 in ZR  = protein-consistent (down in ZR with age) → supports our story\n",
+"  LDLR logFC>0 in ZG  = would explain GTEx bulk RNA UP via ZG (zonal cancellation)\n",
+"  opposite signs ZR vs ZG = the zonal-decoupling mechanism, now at RNA single-cell level\n")
+```
+```{r}
+# ============================================================
+# DIAGNOSTIC — is the null real, or an artifact of pseudobulk setup?
+# Check 3 things: (a) per-donor spread (outlier surgical samples?),
+# (b) does a KNOWN aging signal show up at all (positive control),
+# (c) are counts/normalization sane.
+# ============================================================
+suppressMessages({library(Seurat); library(Matrix); library(edgeR); library(limma)})
+setwd("data/singlecell")
+obj <- readRDS("Hum_Adr_scRNA_anall.combined.rds")
+DefaultAssay(obj) <- "RNA"
+md <- obj@meta.data
+ct <- as.character(md$celltype)
+md$zone <- ifelse(grepl("reticularis|\\bZR\\b",ct,ignore.case=T),"ZR",
+           ifelse(grepl("fasciculata|\\bZF\\b",ct,ignore.case=T),"ZF",
+           ifelse(grepl("glomerulosa|\\bZG\\b",ct,ignore.case=T),"ZG",
+           ifelse(grepl("^adrenal cortex",ct,ignore.case=T),"Cortex_unzoned",NA))))
+counts <- GetAssayData(obj,assay="RNA",layer="counts")
+
+# ---- (a) PER-DONOR CPM for keystones in ZR: see the actual spread ----
+panel <- c(CYB5A="ENSG00000166347", SULT2A1="ENSG00000105398", LDLR="ENSG00000130164",
+           SCARB1="ENSG00000073060", SOAT1="ENSG00000057252", CYP17A1="ENSG00000148795")
+cat("\n===== PER-DONOR CPM in ZR (log2 CPM+1) — look for outlier donors =====\n")
+for (z in c("ZR","ZG")) {
+  sel <- md$zone==z & md$age %in% c("Elderly","Young") & !is.na(md$zone)
+  udon <- unique(md$orig.ident[sel])
+  mat <- sapply(udon, function(d) Matrix::rowSums(counts[,sel & md$orig.ident==d,drop=FALSE]))
+  cpm <- t(t(mat)/colSums(mat))*1e6
+  age <- md$age[match(udon, md$orig.ident)]
+  cat("\n--",z,"-- (columns = donors, sorted young then elderly)\n")
+  ord <- order(age, udon)
+  tab <- round(log2(cpm[panel,ord]+1),2); colnames(tab) <- paste0(substr(age[ord],1,1),"_",udon[ord])
+  rownames(tab) <- names(panel); print(tab)
+}
+
+# ---- (b) POSITIVE CONTROL: CDKN2A/p21/inflammaging should rise in elderly ----
+# CDKN1A=ENSG00000124762 (p21), CDKN2A=ENSG00000147889 (p16), B2M=ENSG00000166710
+cat("\n===== POSITIVE CONTROL: known aging-UP genes in ZR (expect logFC>0) =====\n")
+ctrl <- c(CDKN1A="ENSG00000124762", CDKN2A="ENSG00000147889", B2M="ENSG00000166710",
+          CDKN1B="ENSG00000111276", GDF15="ENSG00000130513")
+sel <- md$zone=="ZR" & md$age %in% c("Elderly","Young") & !is.na(md$zone)
+udon <- unique(md$orig.ident[sel])
+mat <- sapply(udon, function(d) Matrix::rowSums(counts[,sel & md$orig.ident==d,drop=FALSE]))
+age <- factor(md$age[match(udon,md$orig.ident)], levels=c("Young","Elderly"))
+dge <- DGEList(mat); dge <- calcNormFactors(dge)
+keep <- filterByExpr(dge, group=age); dge <- dge[keep,,keep.lib.sizes=FALSE]
+v <- voom(dge, model.matrix(~age)); fit <- eBayes(lmFit(v, model.matrix(~age)))
+tt <- topTable(fit, coef=2, number=Inf, sort.by="none"); tt$ens <- rownames(tt)
+for (g in names(ctrl)) {
+  r <- tt[tt$ens==ctrl[g],]
+  if (nrow(r)) cat(sprintf("  %-7s logFC=%6.2f  p=%.3f  adj=%.3f\n", g, r$logFC, r$P.Value, r$adj.P.Val))
+  else cat(sprintf("  %-7s not expressed / filtered\n", g))
+}
+cat("\n^ If these are also flat/non-sig, the cohort lacks power for ANY aging DE (expected with n=4 young,\n",
+"  surgical noise). If they're clearly UP, then our steroidogenic nulls are real biology, not low power.\n")
+
+# ---- (c) sanity: total pseudobulk depth per donor ----
+cat("\n===== library size per ZR pseudobulk donor (sanity) =====\n")
+print(round(sort(colSums(mat))/1e3,1))  # in thousands
+```
+```{r}
+# ============================================================
+# STEP 1 — ZONE-IDENTITY CONSENSUS across datasets (per-dataset, then agree)
+# Question: which genes robustly mark ZR / ZF / ZG, reproducibly across the
+# independent datasets — despite platform/depth differences?
+# Method: within each dataset, rank each gene's specificity for a zone
+# (AUC via presto/wilcox), then count in how many datasets it lands top-ranked.
+# Scale-free & per-dataset → platform offset cannot create agreement.
+# ============================================================
+suppressMessages({library(Seurat); library(Matrix)})
+setwd("data/singlecell")
+obj <- readRDS("Hum_Adr_scRNA_anall.combined.rds")
+DefaultAssay(obj) <- "RNA"
+md <- obj@meta.data
+
+# --- map donor -> dataset/platform (from your `find` output + Summary.xlsx) ---
+# Elderly1-2 & Young1-2 patterns: infer dataset from orig.ident naming.
+# NAGr-* = Altieri snRNA (E-MTAB-12129). Adjust if you know the exact mapping.
+donor <- as.character(md$orig.ident)
+dataset <- dplyr::case_when(
+  grepl("NAGr", rownames(md)) ~ "Altieri_snRNA",
+  donor %in% c("Elderly1","Elderly2","Young1") ~ "molmet_10x",
+  donor %in% c("Elderly3","Elderly4","Elderly5","Young2") ~ "dsB",
+  donor %in% c("Elderly6","Young3","Young4") ~ "dsC",
+  donor %in% c("Fetal1","Fetal2","Fetal3","Neonatal1","Neonatal2") ~ "HCL_fetal_neo",
+  TRUE ~ "other"
+)
+md$dataset <- dataset
+cat("=== donor x dataset (VERIFY this mapping is right!) ===\n")
+print(table(md$orig.ident, md$dataset))
+cat("\nIf mapping looks wrong, tell me the correct donor->study assignment before trusting Step 2.\n")
+
+# --- coarse zone ---
+ct <- as.character(md$celltype)
+md$zone <- ifelse(grepl("reticularis|\\bZR\\b",ct,ignore.case=T),"ZR",
+           ifelse(grepl("fasciculata|\\bZF\\b",ct,ignore.case=T),"ZF",
+           ifelse(grepl("glomerulosa|\\bZG\\b",ct,ignore.case=T),"ZG",NA)))
+obj@meta.data <- md
+
+# --- per-dataset zone-marker ranking (only cortical zones, only datasets with the zone) ---
+suppressMessages(if(!requireNamespace("presto",quietly=TRUE)) message("presto not installed; using wilcox (slower)"))
+datasets <- setdiff(unique(md$dataset), c("HCL_fetal_neo","other"))
+zones <- c("ZR","ZF","ZG")
+ranklist <- list()
+
+for (ds in datasets) {
+  cells_ds <- rownames(md)[md$dataset==ds & !is.na(md$zone)]
+  if (length(cells_ds) < 200) { cat("skip",ds,"(too few zoned cells)\n"); next }
+  sub <- subset(obj, cells = cells_ds)
+  Idents(sub) <- sub@meta.data$zone
+  for (z in zones) {
+    if (sum(Idents(sub)==z) < 30) next
+    m <- tryCatch(FindMarkers(sub, ident.1=z, only.pos=TRUE, min.pct=0.1,
+                              logfc.threshold=0.25, verbose=FALSE),
+                  error=function(e) NULL)
+    if (is.null(m)||!nrow(m)) next
+    m <- m[order(-m$avg_log2FC),]
+    ranklist[[paste(ds,z,sep="__")]] <- head(rownames(m), 100)  # top-100 markers
+  }
+}
+
+# --- consensus: for each zone, how many datasets share each top marker ---
+panel <- c(CYB5A="ENSG00000166347",SULT2A1="ENSG00000105398",AKR1C3="ENSG00000196139",
+           OSBPL6="ENSG00000188931",LDLR="ENSG00000130164",SCARB1="ENSG00000073060",
+           SOAT1="ENSG00000057252",CYP11B1="ENSG00000160882",HSD3B2="ENSG00000203859",
+           CYP17A1="ENSG00000148795",FDX1="ENSG00000137714",NR5A1="ENSG00000136931",
+           CYP11B2="ENSG00000179142",CYP11A1="ENSG00000140459")
+rev_panel <- setNames(names(panel), panel)
+
+cat("\n\n########## ZONE-IDENTITY CONSENSUS ##########\n")
+for (z in zones) {
+  keys <- grep(paste0("__",z,"$"), names(ranklist), value=TRUE)
+  if (length(keys)<2) { cat("\n",z,": <2 datasets, no consensus possible\n"); next }
+  allg <- unlist(ranklist[keys])
+  tab <- sort(table(allg), decreasing=TRUE)
+  consensus <- names(tab)[tab >= 2]   # marker in >=2 datasets
+  cat(sprintf("\n== %s == (%d datasets: %s)\n", z, length(keys),
+              paste(sub(paste0("__",z),"",keys), collapse=", ")))
+  cat("  # genes marking",z,"in >=2 datasets:", length(consensus), "\n")
+  # how many are our panel?
+  hits <- intersect(consensus, panel)
+  if (length(hits)) for (h in hits)
+    cat(sprintf("   PANEL: %-8s in %d/%d datasets\n", rev_panel[h], tab[h], length(keys)))
+}
+
+# --- save the consensus signatures ---
+saveRDS(ranklist, "STEP1_perdataset_zone_markers.rds")
+cat("\nsaved STEP1_perdataset_zone_markers.rds\n")
+cat("\nNEXT: if CYB5A/SULT2A1 recur as ZR consensus across datasets → backbone is solid,\n",
+"      proceed to Step 2 (aging-direction consensus) only on age-spanning datasets.\n")
+```
+```{r}
+# ============================================================
+# OPTION C — D1 consensus zonal signature · D2 developmental trajectory · D3 aging examples
+# Runs on the integrated object. ~10-15 min. Needs Seurat, Matrix, ggplot2.
+# ============================================================
+suppressMessages({library(Seurat); library(Matrix); library(ggplot2)})
+setwd("data/singlecell")
+obj <- readRDS("Hum_Adr_scRNA_anall.combined.rds")
+DefaultAssay(obj) <- "RNA"
+md <- obj@meta.data
+ct <- as.character(md$celltype)
+md$zone <- ifelse(grepl("reticularis|\\bZR\\b",ct,ignore.case=T),"ZR",
+           ifelse(grepl("fasciculata|\\bZF\\b",ct,ignore.case=T),"ZF",
+           ifelse(grepl("glomerulosa|\\bZG\\b",ct,ignore.case=T),"ZG",
+           ifelse(grepl("^adrenal cortex",ct,ignore.case=T),"Cortex",NA))))
+md$age <- factor(md$age, levels=c("Fetal","Neonatal","Young","Elderly"))
+obj@meta.data <- md
+
+# dataset grouping (for D1 consensus + D3). NOTE: partly structural, exact for molmet.
+donor <- as.character(md$orig.ident)
+md$dataset <- dplyr::case_when(
+  grepl("NAGr", rownames(md))                    ~ "Altieri_snRNA",
+  donor %in% c("Elderly1","Elderly2","Young1")   ~ "molmet_10x",
+  donor %in% c("Elderly3","Elderly4","Elderly5","Young2") ~ "dsB",
+  donor %in% c("Elderly6","Young3","Young4")      ~ "dsC",
+  grepl("Fetal|Neonatal", donor)                  ~ "HCL",
+  TRUE ~ "other")
+obj@meta.data <- md
+
+panel <- c(CYB5A="ENSG00000166347",SULT2A1="ENSG00000105398",AKR1C3="ENSG00000196139",
+           OSBPL6="ENSG00000188931",LDLR="ENSG00000130164",SCARB1="ENSG00000073060",
+           SOAT1="ENSG00000057252",CYP11B1="ENSG00000160882",HSD3B2="ENSG00000203859",
+           CYP17A1="ENSG00000148795",FDX1="ENSG00000137714",NR5A1="ENSG00000136931",
+           CYP11B2="ENSG00000179142",CYP11A1="ENSG00000140459",
+           STAR="ENSG00000147465",FDXR="ENSG00000161513",MC2R="ENSG00000185231")
+rev_panel <- setNames(names(panel), panel)
+
+# ---- module gene sets (Ensembl) — the three limbs ----
+mods <- list(
+  Androgen    = c("ENSG00000166347","ENSG00000105398","ENSG00000196139","ENSG00000188931","ENSG00000148795"), # CYB5A,SULT2A1,AKR1C3,OSBPL6,CYP17A1
+  Cholesterol = c("ENSG00000130164","ENSG00000073060","ENSG00000057252"),                                     # LDLR,SCARB1,SOAT1
+  Cortisol    = c("ENSG00000160882"),                                                                          # CYP11B1
+  Steroidogenic_core = c("ENSG00000147465","ENSG00000140459","ENSG00000161513","ENSG00000136931")              # STAR,CYP11A1,FDXR,NR5A1
+)
+mods <- lapply(mods, function(g) intersect(g, rownames(obj)))
+
+# ================= D1: CONSENSUS ZONAL SIGNATURE (full gene lists) =================
+cat("\n########## D1: consensus zonal markers (>=2 datasets), full export ##########\n")
+datasets <- c("molmet_10x","dsB","dsC","Altieri_snRNA")
+zones <- c("ZR","ZF","ZG")
+ranklist <- list()
+for (ds in datasets) {
+  cells_ds <- rownames(md)[md$dataset==ds & !is.na(md$zone) & md$zone!="Cortex"]
+  if (length(cells_ds) < 200) next
+  sub <- subset(obj, cells=cells_ds); Idents(sub) <- sub$zone
+  for (z in zones) {
+    if (sum(Idents(sub)==z) < 30) next
+    m <- tryCatch(FindMarkers(sub, ident.1=z, only.pos=TRUE, min.pct=0.1,
+                  logfc.threshold=0.25, verbose=FALSE), error=function(e) NULL)
+    if (!is.null(m) && nrow(m)) ranklist[[paste(ds,z,sep="__")]] <- rownames(m[order(-m$avg_log2FC),])[1:min(150,nrow(m))]
+  }
+}
+consensus_sig <- list()
+for (z in zones) {
+  keys <- grep(paste0("__",z,"$"), names(ranklist), value=TRUE)
+  if (length(keys)<2) next
+  tab <- sort(table(unlist(ranklist[keys])), decreasing=TRUE)
+  cons <- data.frame(ensembl=names(tab), n_datasets=as.integer(tab),
+                     symbol=ifelse(names(tab) %in% names(rev_panel), rev_panel[names(tab)], ""),
+                     zone=z, n_total=length(keys))
+  cons <- cons[cons$n_datasets>=2,]
+  consensus_sig[[z]] <- cons
+  cat(sprintf("  %s: %d consensus genes across %d datasets\n", z, nrow(cons), length(keys)))
+}
+consensus_all <- do.call(rbind, consensus_sig)
+write.csv(consensus_all, "D1_consensus_zonal_signature.csv", row.names=FALSE)
+cat("saved D1_consensus_zonal_signature.csv\n")
+
+# ================= D2: DEVELOPMENTAL TRAJECTORY of zonal PROGRAMS =================
+# module scores per cell, then per-donor mean within zone across life stages
+cat("\n########## D2: developmental trajectory of limb modules ##########\n")
+for (mn in names(mods)) obj <- AddModuleScore(obj, features=list(mods[[mn]]), name=paste0("mod_",mn), seed=1)
+score_cols <- grep("^mod_", colnames(obj@meta.data), value=TRUE)
+names(score_cols) <- names(mods)
+
+d2 <- obj@meta.data
+d2 <- d2[!is.na(d2$zone) & d2$zone %in% zones,]
+# per-donor x zone x stage mean module score (donor = replication unit)
+agg <- aggregate(d2[,score_cols], by=list(donor=d2$orig.ident, zone=d2$zone, age=d2$age), FUN=mean)
+colnames(agg)[grep("^mod_", colnames(agg))] <- names(mods)
+write.csv(agg, "D2_module_scores_perDonor_byZoneStage.csv", row.names=FALSE)
+cat("saved D2_module_scores_perDonor_byZoneStage.csv\n")
+cat("\n-- Androgen module: mean per stage x zone (donor-averaged) --\n")
+for (z in zones) {
+  sub <- agg[agg$zone==z,]
+  ms <- tapply(sub$Androgen, sub$age, function(x) round(mean(x),3))
+  ns <- tapply(sub$Androgen, sub$age, length)
+  cat(sprintf("  %s: ", z)); for (s in levels(md$age)) if(!is.na(ms[s])) cat(sprintf("%s=%.3f(n%d) ", s, ms[s], ns[s])); cat("\n")
+}
+cat("\n-- Cholesterol module: mean per stage x zone --\n")
+for (z in zones) {
+  sub <- agg[agg$zone==z,]
+  ms <- tapply(sub$Cholesterol, sub$age, function(x) round(mean(x),3))
+  cat(sprintf("  %s: ", z)); for (s in levels(md$age)) if(!is.na(ms[s])) cat(sprintf("%s=%.3f ", s, ms[s])); cat("\n")
+}
+
+# plot: developmental trajectory of each module in ZR (the key zone)
+library(ggplot2)
+pd <- agg[agg$zone=="ZR",]
+long <- reshape(pd, varying=names(mods), v.names="score", timevar="module",
+                times=names(mods), direction="long")
+p <- ggplot(long, aes(age, score, group=module)) +
+  stat_summary(fun=mean, geom="line", aes(color=module), linewidth=1) +
+  stat_summary(fun=mean, geom="point", aes(color=module), size=2) +
+  geom_jitter(aes(color=module), width=0.08, alpha=0.35, size=1) +
+  facet_wrap(~module, scales="free_y") + theme_bw(base_size=11) +
+  labs(title="D2: ZR zonal programs across the human lifespan (per-donor)",
+       subtitle="Fetal/Neonatal = HCL microwell; Young/Elderly = 10x/snRNA — platform noted",
+       x=NULL, y="module score (per-cell mean, donor-averaged)") +
+  theme(legend.position="none", axis.text.x=element_text(angle=30,hjust=1))
+ggsave("D2_ZR_lifespan_modules.pdf", p, width=8, height=6)
+cat("saved D2_ZR_lifespan_modules.pdf\n")
+
+# ================= D3: AGING as 2 transparent examples (NOT pooled) =================
+cat("\n########## D3: aging examples (molmet within-dataset; per-donor, descriptive) ##########\n")
+# molmet has Young1 vs Elderly1/2 — the one structurally-clean within-dataset old-vs-young
+mm <- obj@meta.data
+mm <- mm[mm$dataset=="molmet_10x" & mm$zone %in% zones,]
+counts <- GetAssayData(obj, assay="RNA", layer="counts")
+cat("molmet donors x zone (cells):\n"); print(table(mm$orig.ident, mm$zone))
+cat("\n-- molmet per-donor log2 CPM for panel in ZR (Young1 vs Elderly1/2) --\n")
+selZR <- rownames(mm)[mm$zone=="ZR"]
+don <- mm[selZR,"orig.ident"]; udon <- unique(don)
+mat <- sapply(udon, function(d) Matrix::rowSums(counts[panel, selZR[don==d], drop=FALSE]))
+lib <- sapply(udon, function(d) sum(counts[, selZR[don==d]]))
+cpm <- round(log2(t(t(mat)/lib)*1e6 + 1), 2); rownames(cpm) <- rev_panel[rownames(cpm)]
+print(cpm)
+cat("\nInterpretation: this is ONE dataset, n=1 young. Report as an example of androgen-limb direction,\n",
+    "NOT as evidence. Note whetthe CYB5A/SULT2A1/CYP17A1 are lower in Elderly1/2 than Young1.\n")
+
+saveRDS(consensus_sig, "D1_consensus_sig_list.rds")
+cat("\n=== DONE. Paste: D1 counts, D2 androgen+cholesterol trajectories, D3 molmet table. ===\n")
+```
+```{r}
+# ============================================================
+# D2-VERIFY — is the ZR androgen decline real, or platform/noise?
+# (1) test Young-vs-Elderly step alone (both 10x/snRNA adult, no HCL confound)
+# (2) test full monotonic trend (Spearman of donor score vs ordinal stage)
+# (3) show per-donor points with platform flagged, so HCL outliers are visible
+# ============================================================
+suppressMessages({library(Seurat)})
+agg <- read.csv("D2_module_scores_perDonor_byZoneStage.csv")
+agg$stage_num <- match(agg$age, c("Fetal","Neonatal","Young","Elderly"))
+agg$platform <- ifelse(agg$age %in% c("Fetal","Neonatal"), "HCL_microwell", "10x/snRNA")
+
+cat("=== ZR androgen module — per donor (platform flagged) ===\n")
+zr <- agg[agg$zone=="ZR", c("donor","age","platform","Androgen","Cholesterol")]
+zr <- zr[order(match(zr$age,c("Fetal","Neonatal","Young","Elderly"))),]
+print(zr, row.names=FALSE, digits=3)
+
+cat("\n=== (1) ADULT-ONLY Young vs Elderly (no platform confound; both 10x/sn) ===\n")
+for (mod in c("Androgen","Cholesterol","Cortisol","Steroidogenic_core")) {
+  for (z in c("ZR","ZF","ZG")) {
+    d <- agg[agg$zone==z & agg$age %in% c("Young","Elderly"),]
+    if (length(unique(d$age))<2) next
+    y <- d[[mod]][d$age=="Young"]; e <- d[[mod]][d$age=="Elderly"]
+    if (length(y)<2||length(e)<2) next
+    w <- wilcox.test(e, y); dir <- ifelse(median(e)<median(y),"DOWN","UP")
+    cat(sprintf("  %-18s %s: Young=%.3f Elderly=%.3f  %s  p=%.3f\n",
+                mod, z, median(y), median(e), dir, w$p.value))
+  }
+}
+
+cat("\n=== (2) MONOTONIC lifespan trend (Spearman donor-score vs stage, ZR) ===\n")
+for (mod in c("Androgen","Cholesterol","Cortisol","Steroidogenic_core")) {
+  d <- agg[agg$zone=="ZR",]
+  ct <- cor.test(d$stage_num, d[[mod]], method="spearman")
+  cat(sprintf("  %-18s rho=%+.3f p=%.4f\n", mod, ct$estimate, ct$p.value))
+}
+
+cat("\n=== (3) platform check: do HCL fetal/neonatal sit apart from the adult trend? ===\n")
+cat("  If ZR androgen Young(0.927)+Elderly(0.783) already decline WITHOUT fetal/neo,\n")
+cat("  the adult decline stands on 10x alone. Fetal/neo only EXTEND it (platform-mixed).\n")
+
+# clean adult-only ZR androgen plot
+library(ggplot2)
+adult <- agg[agg$zone=="ZR" & agg$age %in% c("Young","Elderly"),]
+p <- ggplot(adult, aes(age, Androgen)) +
+  geom_boxplot(outlier.shape=NA, fill="grey90") +
+  geom_jitter(width=0.12, size=2.5, aes(color=age)) +
+  theme_bw(base_size=12) + theme(legend.position="none") +
+  labs(title="ZR androgen program: young vs elderly ADULT (10x/sn only)",
+       subtitle="donor-level; the platform-clean core of the lifespan decline",
+       y="androgen module score (donor mean)", x=NULL)
+ggsave("D2verify_ZR_androgen_adultonly.pdf", p, width=5, height=5)
+cat("\nsaved D2verify_ZR_androgen_adultonly.pdf\n")
+```
+
+```{r}
+# ============================================================
+# D2-CROSSCHECK — the elderly cholesterol bimodality: platform, sex, or biology?
+# Also: recompute ZR androgen adult-step WITHOUT hand-removing anyone,
+# but report it with Young4 flagged so reviewers see the leverage point.
+# ============================================================
+agg <- read.csv("D2_module_scores_perDonor_byZoneStage.csv")
+zr <- agg[agg$zone=="ZR",]
+
+# pull gender back in (from object) — need donor->gender
+suppressMessages(library(Seurat))
+obj <- readRDS("Hum_Adr_scRNA_anall.combined.rds")
+g <- unique(obj@meta.data[,c("orig.ident","age","gender")])
+zr <- merge(zr, g, by.x="donor", by.y="orig.ident", all.x=TRUE)
+zr$platform <- ifelse(zr$age.x %in% c("Fetal","Neonatal"),"HCL",
+               ifelse(grepl("Elderly[789]", zr$donor),"snRNA_NAGr","10x"))
+
+cat("=== ELDERLY donors: cholesterol vs platform/sex ===\n")
+eld <- zr[zr$age.x=="Elderly", c("donor","Cholesterol","Androgen","gender","platform")]
+print(eld[order(-eld$Cholesterol),], row.names=FALSE, digits=3)
+
+cat("\n=== does elderly cholesterol split by platform? ===\n")
+hi <- eld$Cholesterol > 0.5
+print(table(hi_chol=hi, platform=eld$platform))
+print(table(hi_chol=hi, sex=eld$gender))
+
+cat("\n=== ZR androgen adult step, Young4 flagged (NOT removed) ===\n")
+ad <- zr[zr$age.x %in% c("Young","Elderly"), c("donor","Androgen","age.x")]
+print(ad[order(ad$age.x, -ad$Androgen),], row.names=FALSE, digits=3)
+cat("\n with all donors: Young median", round(median(ad$Androgen[ad$age.x=="Young"]),3),
+    "Elderly", round(median(ad$Androgen[ad$age.x=="Elderly"]),3),"\n")
+cat(" (Young4=0.149 is the low-leverage point; reporting WITH it, honestly)\n")
+
+# is the elderly cholesterol high-group the snRNA (nucleus) samples? that would be the artifact
+cat("\n=== VERDICT LOGIC ===\n")
+cat("  if hi-cholesterol elderly == snRNA_NAGr (nucleus prep) -> likely technical (nuclear retention\n")
+cat("     of certain transcripts differs sc vs sn) -> report cholesterol-up as NOT robust.\n")
+cat("  if hi-cholesterol splits by sex or neitthe -> keep as descriptive decoupling-consistent signal.\n")
+```
+```{r}
+# ============================================================
+# DECONV — STAGE 1 : build single-cell reference from the integrated atlas's object
+# Output: an ExpressionSet (raw counts + cell metadata) MuSiC/Bisque consume.
+# Run once. ~5 min. Needs: Seurat, Biobase.
+# ============================================================
+suppressMessages({library(Seurat); library(Matrix); library(Biobase)})
+setwd("data/gtex")
+obj <- readRDS("data/singlecell/Hum_Adr_scRNA_anall.combined.rds")
+DefaultAssay(obj) <- "RNA"
+md <- obj@meta.data
+
+# ---- collapse 41 fine clusters to a deconvolution-appropriate label set ----
+# Keep cortical zones separate (our interest) + all non-cortical compartments (so their
+# signal isn't forced into zones). Drop fetal-only / proliferating (not in adult GTEx).
+ct <- as.character(md$celltype)
+lab <- dplyr::case_when(
+  grepl("reticularis|\\bZR\\b", ct, ignore.case=T) ~ "ZR",
+  grepl("fasciculata|\\bZF\\b", ct, ignore.case=T) ~ "ZF",
+  grepl("glomerulosa|\\bZG\\b", ct, ignore.case=T) ~ "ZG",
+  grepl("^adrenal cortex", ct, ignore.case=T)       ~ "Cortex_unspec",
+  grepl("medulla|chromaffin", ct, ignore.case=T)    ~ "Medulla",
+  grepl("endothelial|vascular", ct, ignore.case=T)  ~ "Endothelial",
+  grepl("fibroblast|VSMC|pericyte|capsule", ct, ignore.case=T) ~ "Stromal",
+  grepl("macrophage|monocyte|neutrophil|T-cell|NK|lymphoid|immune", ct, ignore.case=T) ~ "Immune",
+  grepl("schwann|glia", ct, ignore.case=T)          ~ "Glia",
+  TRUE ~ "Other")
+md$deconv_label <- lab
+
+# ---- restrict reference to ADULT donors (match GTEx = adult tissue) ----
+# fetal/neonatal expression programs would bias adult deconvolution
+keep <- md$age %in% c("Young","Elderly") & md$deconv_label != "Other"
+cat("reference cells kept (adult, labeled):", sum(keep), "\n")
+cat("label composition:\n"); print(sort(table(md$deconv_label[keep]), decreasing=TRUE))
+cat("donors in reference:\n"); print(table(md$orig.ident[keep]))
+
+# ---- raw counts (MuSiC needs RAW counts, not integrated/normalized) ----
+counts <- GetAssayData(obj, assay="RNA", layer="counts")[, keep]
+meta   <- md[keep, c("orig.ident","deconv_label","age","gender")]
+colnames(meta) <- c("SubjectName","cellType","age","gender")
+
+# ---- ExpressionSet ----
+pheno <- new("AnnotatedDataFrame", data=meta)
+sc.eset <- ExpressionSet(assayData=as.matrix(counts), phenoData=pheno)
+saveRDS(sc.eset, "DECONV_reference_scEset.rds")
+cat("\nsaved DECONV_reference_scEset.rds  |  genes:", nrow(sc.eset), " cells:", ncol(sc.eset), "\n")
+cat("gene ID type:", head(rownames(sc.eset),1), "(Ensembl expected)\n")
+```
+```{r}
+# ============================================================
+# DECONV — STAGE 2 (revised) : sparse-safe MuSiC, Designs A + B, Bisque concordance
+# Fixes: (1) no dense coercion (18GiB crash), (2) both cortex granularities,
+# (3) real fraction → §4 partial-correlation confound control.
+# ~15-25 min. Needs: MuSiC, BisqueRNA, Biobase, ppcor, readxl.
+# ============================================================
+suppressMessages({library(Biobase); library(MuSiC); library(BisqueRNA)
+                  library(Matrix); library(ppcor); library(readxl)})
+setwd("data/gtex")
+
+# ---- rebuild reference with BOTH label granularities, keep SPARSE ----
+suppressMessages(library(Seurat))
+obj <- readRDS("data/singlecell/Hum_Adr_scRNA_anall.combined.rds")
+DefaultAssay(obj) <- "RNA"; md <- obj@meta.data
+ct <- as.character(md$celltype)
+fine <- dplyr::case_when(
+  grepl("reticularis|\\bZR\\b",ct,ignore.case=T)~"ZR",
+  grepl("fasciculata|\\bZF\\b",ct,ignore.case=T)~"ZF",
+  grepl("glomerulosa|\\bZG\\b",ct,ignore.case=T)~"ZG",
+  grepl("^adrenal cortex",ct,ignore.case=T)~"Cortex_unspec",
+  grepl("medulla|chromaffin",ct,ignore.case=T)~"Medulla",
+  grepl("endothelial|vascular",ct,ignore.case=T)~"Endothelial",
+  grepl("fibroblast|VSMC|pericyte|capsule",ct,ignore.case=T)~"Stromal",
+  grepl("macrophage|monocyte|neutrophil|T-cell|NK|lymphoid|immune",ct,ignore.case=T)~"Immune",
+  grepl("schwann|glia",ct,ignore.case=T)~"Glia", TRUE~"Other")
+coarse <- ifelse(fine %in% c("ZR","ZF","ZG","Cortex_unspec"), "Cortex", fine)
+keep <- md$age %in% c("Young","Elderly") & fine!="Other"
+
+counts <- GetAssayData(obj, assay="RNA", layer="counts")[, keep]   # stays dgCMatrix (sparse)
+rownames(counts) <- sub("\\..*$","", rownames(counts))
+meta <- data.frame(SubjectName=md$orig.ident[keep],
+                   cellType_fine=fine[keep], cellType_coarse=coarse[keep])
+rm(obj); gc()
+
+# MuSiC 2.x accepts SingleCellExperiment (sparse-safe). Build SCE, not ExpressionSet.
+suppressMessages(library(SingleCellExperiment))
+sce <- SingleCellExperiment(assays=list(counts=counts), colData=meta)
+
+# ---- load GTEx ----
+read_gct <- function(path){ df<-read.delim(path,skip=2,check.names=FALSE,stringsAsFactors=FALSE)
+  rn<-sub("\\..*$","",df$Name); mat<-as.matrix(df[,-(1:2)]); rownames(mat)<-rn; mat[!duplicated(rn),] }
+bulk <- read_gct("gene_reads_v10_adrenal_gland.gct")
+common <- intersect(rownames(bulk), rownames(sce))
+cat("shared genes:", length(common), "\n")
+bulk <- bulk[common,]
+
+run_music <- function(clust){
+  cat("\n=== MuSiC on", clust, "===\n")
+  fit <- music_prop(bulk.mtx=bulk, sc.sce=sce[common,], clusters=clust,
+                    samples="SubjectName", verbose=FALSE)
+  p <- as.data.frame(fit$Est.prop.weighted); p$SampleID <- rownames(p)
+  cat("mean fractions:\n"); print(round(sort(colMeans(p[,setdiff(names(p),'SampleID')]),decreasing=T),4))
+  p
+}
+propB <- run_music("cellType_coarse")   # Design B: total Cortex — robust
+propA <- run_music("cellType_fine")      # Design A: ZR sub-fraction — noisy, conservative
+write.csv(propB,"DECONV_MuSiC_coarse_cortex.csv",row.names=FALSE)
+write.csv(propA,"DECONV_MuSiC_fine_zones.csv",row.names=FALSE)
+
+# ---- §4 confound control: partial Spearman adjusting for real fractions ----
+tpm <- read_gct("gene_tpm_v10_adrenal_gland.gct")
+meta_x <- read_excel("GTEx Adrenal.xlsx")
+short <- function(x) sub("^(GTEX-[^-]+).*","\\1",x)
+age_map <- setNames(as.numeric(sub("-.*","",meta_x$Age_Group))+5, short(meta_x$SampleID))
+panel <- c(CYB5A="ENSG00000166347",LDLR="ENSG00000130164",SCARB1="ENSG00000073060",
+           SOAT1="ENSG00000057252",SULT2A1="ENSG00000105398",OSBPL6="ENSG00000188931",
+           AKR1C3="ENSG00000196139",CYP11B1="ENSG00000160882",HMGCR="ENSG00000113161",
+           INSIG1="ENSG00000186480")
+
+confound <- function(prop, fracname, label){
+  prop$short <- short(prop$SampleID)
+  cs <- short(colnames(tpm)); keepcol <- cs %in% prop$short
+  tp <- tpm[,keepcol]; csk <- cs[keepcol]
+  ord <- match(csk, prop$short)
+  frac <- prop[[fracname]][ord]; age <- age_map[csk]
+  cat(sprintf("\n=== §4 CONTROL adjusting for %s (%s) ===\n%-8s %8s %10s %9s\n",
+              fracname,label,"gene","rho_raw","rho|frac","p"))
+  out<-data.frame()
+  for(g in names(panel)){ e<-tp[panel[g],]; if(is.null(e)) next
+    ok<-complete.cases(e,age,frac); if(sum(ok)<20) next
+    raw<-cor(rank(e[ok]),rank(age[ok]))
+    pc<-pcor.test(rank(e[ok]),rank(age[ok]),rank(frac[ok]),method="spearman")
+    cat(sprintf("%-8s %8.3f %10.3f %9.2g\n",g,raw,pc$estimate,pc$p.value))
+    out<-rbind(out,data.frame(gene=g,rho_raw=round(raw,3),
+              rho_adj=round(pc$estimate,3),p_adj=signif(pc$p.value,3),covariate=label))
+  }; out
+}
+rB <- confound(propB, "Cortex",  "total_cortex_MuSiC")
+rA <- confound(propA, "ZR",      "ZR_fraction_MuSiC")
+write.csv(rbind(rB,rA), "DECONV_confound_partialSpearman_realFractions.csv", row.names=FALSE)
+
+# ---- Bisque concordance on the robust (coarse) design ----
+cat("\n=== Bisque concordance (coarse cortex) ===\n")
+sc.eset <- ExpressionSet(assayData=as.matrix(counts[common,]),   # Bisque needs matrix; do it once, post-filter
+                         phenoData=new("AnnotatedDataFrame", meta))
+bq <- tryCatch(ReferenceBasedDecomposition(
+        ExpressionSet(assayData=bulk), sc.eset,
+        subject.names="SubjectName", cell.types="cellType_coarse",
+        markers=NULL, use.overlap=FALSE)$bulk.props,
+      error=function(e){cat("Bisque:",conditionMessage(e),"\n");NULL})
+if(!is.null(bq)){ bq<-as.data.frame(t(bq)); bq$short<-short(rownames(bq))
+  m<-propB$Cortex[match(bq$short,propB$short)]
+  cat(sprintf("Cortex fraction MuSiC vs Bisque: Pearson r = %.3f\n", cor(m,bq$Cortex,use="complete.obs")))
+}
+cat("\nDONE. Paste: both mean-fraction blocks, both §4 control tables, Bisque r.\n")
+```
+```{r}
+# ============================================================
+# DECONV — STAGE 2 (revised) : sparse-safe MuSiC, Designs A + B, Bisque concordance
+# Fixes: (1) no dense coercion (18GiB crash), (2) both cortex granularities,
+# (3) real fraction → §4 partial-correlation confound control.
+# ~15-25 min. Needs: MuSiC, BisqueRNA, Biobase, ppcor, readxl.
+# ============================================================
+suppressMessages({library(Biobase); library(MuSiC); library(BisqueRNA)
+                  library(Matrix); library(ppcor); library(readxl)})
+setwd("data/gtex")
+
+# ---- rebuild reference with BOTH label granularities, keep SPARSE ----
+suppressMessages(library(Seurat))
+obj <- readRDS("data/singlecell/Hum_Adr_scRNA_anall.combined.rds")
+DefaultAssay(obj) <- "RNA"; md <- obj@meta.data
+ct <- as.character(md$celltype)
+fine <- dplyr::case_when(
+  grepl("reticularis|\\bZR\\b",ct,ignore.case=T)~"ZR",
+  grepl("fasciculata|\\bZF\\b",ct,ignore.case=T)~"ZF",
+  grepl("glomerulosa|\\bZG\\b",ct,ignore.case=T)~"ZG",
+  grepl("^adrenal cortex",ct,ignore.case=T)~"Cortex_unspec",
+  grepl("medulla|chromaffin",ct,ignore.case=T)~"Medulla",
+  grepl("endothelial|vascular",ct,ignore.case=T)~"Endothelial",
+  grepl("fibroblast|VSMC|pericyte|capsule",ct,ignore.case=T)~"Stromal",
+  grepl("macrophage|monocyte|neutrophil|T-cell|NK|lymphoid|immune",ct,ignore.case=T)~"Immune",
+  grepl("schwann|glia",ct,ignore.case=T)~"Glia", TRUE~"Other")
+coarse <- ifelse(fine %in% c("ZR","ZF","ZG","Cortex_unspec"), "Cortex", fine)
+keep <- md$age %in% c("Young","Elderly") & fine!="Other"
+
+counts <- GetAssayData(obj, assay="RNA", layer="counts")[, keep]   # stays dgCMatrix (sparse)
+rownames(counts) <- sub("\\..*$","", rownames(counts))
+meta <- data.frame(SubjectName=md$orig.ident[keep],
+                   cellType_fine=fine[keep], cellType_coarse=coarse[keep])
+rm(obj); gc()
+
+# MuSiC 2.x accepts SingleCellExperiment (sparse-safe). Build SCE, not ExpressionSet.
+suppressMessages(library(SingleCellExperiment))
+sce <- SingleCellExperiment(assays=list(counts=counts), colData=meta)
+
+# ---- load GTEx ----
+read_gct <- function(path){ df<-read.delim(path,skip=2,check.names=FALSE,stringsAsFactors=FALSE)
+  rn<-sub("\\..*$","",df$Name); mat<-as.matrix(df[,-(1:2)]); rownames(mat)<-rn; mat[!duplicated(rn),] }
+bulk <- read_gct("gene_reads_v10_adrenal_gland.gct")
+common <- intersect(rownames(bulk), rownames(sce))
+cat("shared genes:", length(common), "\n")
+bulk <- bulk[common,]
+
+run_music <- function(clust){
+  cat("\n=== MuSiC on", clust, "===\n")
+  fit <- music_prop(bulk.mtx=bulk, sc.sce=sce[common,], clusters=clust,
+                    samples="SubjectName", verbose=FALSE)
+  p <- as.data.frame(fit$Est.prop.weighted); p$SampleID <- rownames(p)
+  cat("mean fractions:\n"); print(round(sort(colMeans(p[,setdiff(names(p),'SampleID')]),decreasing=T),4))
+  p
+}
+propB <- run_music("cellType_coarse")   # Design B: total Cortex — robust
+propA <- run_music("cellType_fine")      # Design A: ZR sub-fraction — noisy, conservative
+write.csv(propB,"DECONV_MuSiC_coarse_cortex.csv",row.names=FALSE)
+write.csv(propA,"DECONV_MuSiC_fine_zones.csv",row.names=FALSE)
+
+# ---- §4 confound control: partial Spearman adjusting for real fractions ----
+tpm <- read_gct("gene_tpm_v10_adrenal_gland.gct")
+meta_x <- read_excel("GTEx Adrenal.xlsx")
+short <- function(x) sub("^(GTEX-[^-]+).*","\\1",x)
+age_map <- setNames(as.numeric(sub("-.*","",meta_x$Age_Group))+5, short(meta_x$SampleID))
+panel <- c(CYB5A="ENSG00000166347",LDLR="ENSG00000130164",SCARB1="ENSG00000073060",
+           SOAT1="ENSG00000057252",SULT2A1="ENSG00000105398",OSBPL6="ENSG00000188931",
+           AKR1C3="ENSG00000196139",CYP11B1="ENSG00000160882",HMGCR="ENSG00000113161",
+           INSIG1="ENSG00000186480")
+
+confound <- function(prop, fracname, label){
+  prop$short <- short(prop$SampleID)
+  cs <- short(colnames(tpm)); keepcol <- cs %in% prop$short
+  tp <- tpm[,keepcol]; csk <- cs[keepcol]
+  ord <- match(csk, prop$short)
+  frac <- prop[[fracname]][ord]; age <- age_map[csk]
+  cat(sprintf("\n=== §4 CONTROL adjusting for %s (%s) ===\n%-8s %8s %10s %9s\n",
+              fracname,label,"gene","rho_raw","rho|frac","p"))
+  out<-data.frame()
+  for(g in names(panel)){ e<-tp[panel[g],]; if(is.null(e)) next
+    ok<-complete.cases(e,age,frac); if(sum(ok)<20) next
+    raw<-cor(rank(e[ok]),rank(age[ok]))
+    pc<-pcor.test(rank(e[ok]),rank(age[ok]),rank(frac[ok]),method="spearman")
+    cat(sprintf("%-8s %8.3f %10.3f %9.2g\n",g,raw,pc$estimate,pc$p.value))
+    out<-rbind(out,data.frame(gene=g,rho_raw=round(raw,3),
+              rho_adj=round(pc$estimate,3),p_adj=signif(pc$p.value,3),covariate=label))
+  }; out
+}
+rB <- confound(propB, "Cortex",  "total_cortex_MuSiC")
+rA <- confound(propA, "ZR",      "ZR_fraction_MuSiC")
+write.csv(rbind(rB,rA), "DECONV_confound_partialSpearman_realFractions.csv", row.names=FALSE)
+
+# ---- Bisque concordance on the robust (coarse) design ----
+cat("\n=== Bisque concordance (coarse cortex) ===\n")
+sc.eset <- ExpressionSet(assayData=as.matrix(counts[common,]),   # Bisque needs matrix; do it once, post-filter
+                         phenoData=new("AnnotatedDataFrame", meta))
+bq <- tryCatch(ReferenceBasedDecomposition(
+        ExpressionSet(assayData=bulk), sc.eset,
+        subject.names="SubjectName", cell.types="cellType_coarse",
+        markers=NULL, use.overlap=FALSE)$bulk.props,
+      error=function(e){cat("Bisque:",conditionMessage(e),"\n");NULL})
+if(!is.null(bq)){ bq<-as.data.frame(t(bq)); bq$short<-short(rownames(bq))
+  m<-propB$Cortex[match(bq$short,propB$short)]
+  cat(sprintf("Cortex fraction MuSiC vs Bisque: Pearson r = %.3f\n", cor(m,bq$Cortex,use="complete.obs")))
+}
+cat("\nDONE. Paste: both mean-fraction blocks, both §4 control tables, Bisque r.\n")
+```
+```{r}
+# ============================================================
+# BISQUE FIX — concordance check for the coarse (total-cortex) MuSiC fractions.
+# Fixes the sampleNames validity error + the dense-coercion memory blowup.
+# Reuses saved MuSiC output. ~5 min.
+# ============================================================
+suppressMessages({library(Biobase); library(BisqueRNA); library(Matrix); library(Seurat)})
+setwd("data/gtex")
+
+obj <- readRDS("data/singlecell/Hum_Adr_scRNA_anall.combined.rds")
+DefaultAssay(obj) <- "RNA"; md <- obj@meta.data
+ct <- as.character(md$celltype)
+fine <- dplyr::case_when(
+  grepl("reticularis|\\bZR\\b",ct,ignore.case=T)~"ZR",
+  grepl("fasciculata|\\bZF\\b",ct,ignore.case=T)~"ZF",
+  grepl("glomerulosa|\\bZG\\b",ct,ignore.case=T)~"ZG",
+  grepl("^adrenal cortex",ct,ignore.case=T)~"Cortex_unspec",
+  grepl("medulla|chromaffin",ct,ignore.case=T)~"Medulla",
+  grepl("endothelial|vascular",ct,ignore.case=T)~"Endothelial",
+  grepl("fibroblast|VSMC|pericyte|capsule",ct,ignore.case=T)~"Stromal",
+  grepl("macrophage|monocyte|neutrophil|T-cell|NK|lymphoid|immune",ct,ignore.case=T)~"Immune",
+  grepl("schwann|glia",ct,ignore.case=T)~"Glia", TRUE~"Other")
+coarse <- ifelse(fine %in% c("ZR","ZF","ZG","Cortex_unspec"),"Cortex",fine)
+keep <- md$age %in% c("Young","Elderly") & fine!="Other"
+
+counts <- GetAssayData(obj,assay="RNA",layer="counts")[,keep]
+rownames(counts) <- sub("\\..*$","",rownames(counts))
+
+read_gct <- function(path){ df<-read.delim(path,skip=2,check.names=FALSE,stringsAsFactors=FALSE)
+  rn<-sub("\\..*$","",df$Name); mat<-as.matrix(df[,-(1:2)]); rownames(mat)<-rn; mat[!duplicated(rn),] }
+bulk <- read_gct("gene_reads_v10_adrenal_gland.gct")
+common <- intersect(rownames(bulk), rownames(counts))
+
+# subset to shared genes FIRST (shrinks the dense matrix ~17GiB -> manageable), then densify
+sc_sub <- as.matrix(counts[common,])                    # dense only on filtered genes
+rm(obj, counts); gc()
+
+# CRITICAL FIX: give phenoData rownames == colnames(assayData) (that was the validity error)
+pd <- data.frame(SubjectName=md$orig.ident[keep], cellType=coarse[keep])
+rownames(pd) <- colnames(sc_sub)                        # <- the fix
+sc.eset <- ExpressionSet(assayData=sc_sub,
+             phenoData=new("AnnotatedDataFrame", pd))
+
+bulk.eset <- ExpressionSet(assayData=bulk[common,])
+
+cat("running Bisque ...\n")
+bq <- ReferenceBasedDecomposition(bulk.eset, sc.eset,
+        subject.names="SubjectName", cell.types="cellType",
+        markers=NULL, use.overlap=FALSE)
+bqp <- as.data.frame(t(bq$bulk.props)); bqp$SampleID <- rownames(bqp)
+write.csv(bqp, "DECONV_Bisque_coarse_cortex.csv", row.names=FALSE)
+cat("\nBisque mean fractions:\n")
+print(round(sort(colMeans(bqp[,setdiff(names(bqp),'SampleID')]),decreasing=TRUE),4))
+
+# concordance vs saved MuSiC coarse
+mus <- read.csv("DECONV_MuSiC_coarse_cortex.csv")
+short <- function(x) sub("^(GTEX-[^-]+).*","\\1",x)
+mus$s <- short(mus$SampleID); bqp$s <- short(bqp$SampleID)
+m <- merge(mus[,c("s","Cortex")], bqp[,c("s","Cortex")], by="s", suffixes=c("_MuSiC","_Bisque"))
+cat(sprintf("\n=== CONCORDANCE: MuSiC vs Bisque total-cortex fraction ===\nPearson r = %.3f (n=%d)\n",
+    cor(m$Cortex_MuSiC, m$Cortex_Bisque, use="complete.obs"), nrow(m)))
+cat("If r > 0.6, two accepted methods agree on composition → confound control is bulletproof.\n")
+```
+```{r}
+# ============================================================
+# BISQUE-ADJUSTED CONFOUND — the actual test that matters.
+# Does decoupling survive adjustment for the BISQUE cortex fraction
+# (a different estimate than MuSiC's)? Reuses saved Bisque output.
+# ~2 min.
+# ============================================================
+suppressMessages({library(ppcor); library(readxl)})
+setwd("data/gtex")
+
+read_gct <- function(path){ df<-read.delim(path,skip=2,check.names=FALSE,stringsAsFactors=FALSE)
+  rn<-sub("\\..*$","",df$Name); mat<-as.matrix(df[,-(1:2)]); rownames(mat)<-rn; mat[!duplicated(rn),] }
+tpm <- read_gct("gene_tpm_v10_adrenal_gland.gct")
+bq  <- read.csv("DECONV_Bisque_coarse_cortex.csv")
+mus <- read.csv("DECONV_MuSiC_coarse_cortex.csv")
+meta_x <- read_excel("GTEx Adrenal.xlsx")
+short <- function(x) sub("^(GTEX-[^-]+).*","\\1",x)
+age_map <- setNames(as.numeric(sub("-.*","",meta_x$Age_Group))+5, short(meta_x$SampleID))
+
+panel <- c(CYB5A="ENSG00000166347",LDLR="ENSG00000130164",SCARB1="ENSG00000073060",
+           SOAT1="ENSG00000057252",SULT2A1="ENSG00000105398",OSBPL6="ENSG00000188931",
+           AKR1C3="ENSG00000196139",CYP11B1="ENSG00000160882",HMGCR="ENSG00000113161",
+           INSIG1="ENSG00000186480")
+
+bq$s <- short(bq$SampleID)
+cs <- short(colnames(tpm)); keepcol <- cs %in% bq$s
+tp <- tpm[,keepcol]; csk <- cs[keepcol]
+ord <- match(csk, bq$s)
+frac <- bq$Cortex[ord]; age <- age_map[csk]
+
+cat(sprintf("=== §4 CONTROL adjusting for BISQUE cortex fraction ===\n%-8s %8s %10s %9s\n",
+            "gene","rho_raw","rho|Bisq","p"))
+out <- data.frame()
+for(g in names(panel)){ e<-tp[panel[g],]; if(is.null(e)) next
+  ok<-complete.cases(e,age,frac); if(sum(ok)<20) next
+  raw<-cor(rank(e[ok]),rank(age[ok]))
+  pc<-pcor.test(rank(e[ok]),rank(age[ok]),rank(frac[ok]),method="spearman")
+  cat(sprintf("%-8s %8.3f %10.3f %9.2g\n",g,raw,pc$estimate,pc$p.value))
+  out<-rbind(out,data.frame(gene=g,rho_raw=round(raw,3),rho_adj_Bisque=round(pc$estimate,3),
+             p_adj=signif(pc$p.value,3)))
+}
+write.csv(out,"DECONV_confound_partialSpearman_BisqueCortex.csv",row.names=FALSE)
+
+# ALSO: adjust for BOTH fractions simultaneously (strongest test)
+cat("\n=== §4 CONTROL adjusting for BOTH MuSiC + Bisque cortex (2 covariates) ===\n")
+mus$s <- short(mus$SampleID)
+fracM <- mus$Cortex[match(csk, mus$s)]
+cat(sprintf("%-8s %8s %12s %9s\n","gene","rho_raw","rho|both","p"))
+for(g in names(panel)){ e<-tp[panel[g],]; if(is.null(e)) next
+  ok<-complete.cases(e,age,frac,fracM); if(sum(ok)<20) next
+  raw<-cor(rank(e[ok]),rank(age[ok]))
+  # partial correlation of e~age given TWO covariates
+  pc<-pcor.test(rank(e[ok]),rank(age[ok]),data.frame(rank(frac[ok]),rank(fracM[ok])),method="spearman")
+  cat(sprintf("%-8s %8.3f %12.3f %9.2g\n",g,raw,pc$estimate,pc$p.value))
+}
+cat("\nIf LDLR/SCARB1 stay positive+sig adjusting for BOTH estimates → composition definitively excluded.\n")
+```
+```{r}
+# ============================================================
+# SEX-SPLIT GTEx — recompute from raw, verify against Integration_memo_v3.
+# Same inputs as deconvolution. Spearman(expr vs age-bracket) both-sex + M + F.
+# ~3 min. Needs: readxl only (base R otherwise).
+# ============================================================
+setwd("data/gtex")
+library(readxl)
+
+read_gct <- function(path){ df<-read.delim(path,skip=2,check.names=FALSE,stringsAsFactors=FALSE)
+  rn<-sub("\\..*$","",df$Name); mat<-as.matrix(df[,-(1:2)]); rownames(mat)<-rn; mat[!duplicated(rn),] }
+tpm <- read_gct("gene_tpm_v10_adrenal_gland.gct")
+meta <- read_excel("GTEx Adrenal.xlsx")
+cat("metadata columns:", paste(colnames(meta),collapse=", "), "\n")
+cat("sex values:\n"); print(table(meta$Sex))
+cat("age brackets:\n"); print(table(meta$Age_Group))
+
+# map GTEx sample columns -> metadata (short GTEX-XXXXX id)
+short <- function(x) sub("^(GTEX-[^-]+).*","\\1",x)
+meta$short <- short(meta$SampleID)
+col_short <- short(colnames(tpm))
+# age bracket midpoint as ordinal
+meta$age_mid <- as.numeric(sub("-.*","",meta$Age_Group)) + 5
+
+# align
+idx <- match(col_short, meta$short)
+age <- meta$age_mid[idx]; sex <- tolower(meta$Sex[idx])
+cat("\nsamples matched:", sum(!is.na(age)), "of", ncol(tpm),
+    "| M:", sum(sex=="male",na.rm=T), " F:", sum(sex=="female",na.rm=T), "\n")
+
+panel <- c(CYB5A="ENSG00000166347", SULT2A1="ENSG00000105398", AKR1C3="ENSG00000196139",
+           OSBPL6="ENSG00000188931", LDLR="ENSG00000130164", SCARB1="ENSG00000073060",
+           SOAT1="ENSG00000057252", CYP11B1="ENSG00000160882", HMGCR="ENSG00000113161",
+           INSIG1="ENSG00000186480", HSD3B2="ENSG00000203859", CYP17A1="ENSG00000148795",
+           FDX1="ENSG00000137714", NR5A1="ENSG00000136931")
+
+sp <- function(e, a, keep){ ok <- keep & complete.cases(e,a)
+  if(sum(ok)<15) return(c(rho=NA,p=NA,n=sum(ok)))
+  ct <- suppressWarnings(cor.test(e[ok], a[ok], method="spearman"))
+  c(rho=unname(ct$estimate), p=ct$p.value, n=sum(ok)) }
+
+res <- data.frame()
+for(g in names(panel)){
+  e <- tpm[panel[g],]
+  b <- sp(e, age, rep(TRUE,length(age)))
+  m <- sp(e, age, sex=="male")
+  f <- sp(e, age, sex=="female")
+  res <- rbind(res, data.frame(gene=g,
+    rho_both=round(b["rho"],3), p_both=signif(b["p"],2),
+    rho_M=round(m["rho"],3), p_M=signif(m["p"],2), n_M=m["n"],
+    rho_F=round(f["rho"],3), p_F=signif(f["p"],2), n_F=f["n"]))
+}
+# BH-FDR on both-sex p
+res$q_both <- signif(p.adjust(res$p_both, "BH"), 2)
+res <- res[,c("gene","rho_both","q_both","rho_M","p_M","rho_F","p_F","n_M","n_F")]
+rownames(res) <- NULL
+cat("\n########## SEX-SPLIT GTEx (recomputed this session) ##########\n")
+print(res, row.names=FALSE)
+write.csv(res, "RERUN_GTEx_sexsplit_verified.csv", row.names=FALSE)
+cat("\nsaved RERUN_GTEx_sexsplit_verified.csv\n")
+
+cat("\n=== CHECK vs Integration_memo_v3 (should roughly match) ===\n")
+cat("memo: CYB5A both -0.40; M -0.36; F -0.47 | SULT2A1 both -0.28; M -0.22; F -0.41\n")
+cat("memo: CYP11B1 both +0.27; M +0.33; F +0.16(ns) | LDLR/SCARB1/HMGCR male-driven\n")
+cat("If these reproduce, the sex-split table is safe to put in Results v3.\n")
+```
+
